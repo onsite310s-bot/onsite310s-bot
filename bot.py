@@ -60,10 +60,34 @@ logger = logging.getLogger(__name__)
 # Conversation states for report builder
 (
     WAITING_VEHICLE,
-    WAITING_FILES,
-    WAITING_NOTES,
+    WAITING_PHOTOS,
+    WAITING_DOCS,
+    WAITING_ASSESSMENT,
     WAITING_CONFIRM,
-) = range(4)
+) = range(5)
+
+# Photo sections in order
+PHOTO_SECTIONS = [
+    ("front", "Front of vehicle"),
+    ("rear", "Rear of vehicle"),
+    ("driver_side", "Driver side"),
+    ("passenger_side", "Passenger side"),
+    ("vin", "VIN sticker"),
+    ("dash", "Dashboard"),
+    ("interior_1", "Interior — front seats"),
+    ("interior_2", "Interior — rear seats"),
+    ("interior_3", "Interior — additional / trunk area"),
+    ("interior_4", "Trunk / cargo area"),
+    ("engine", "Engine bay"),
+    ("under_1", "Underbody — front"),
+    ("under_2", "Underbody — mid"),
+    ("under_3", "Underbody — rear"),
+    ("under_4", "Underbody — additional angle"),
+    ("wheel_1", "Wheel / rim 1"),
+    ("wheel_2", "Wheel / rim 2"),
+    ("wheel_3", "Wheel / rim 3"),
+    ("wheel_4", "Wheel / rim 4"),
+]
 
 # ──────────────────────────────────────────────────────────────
 # BOOKING: format message + inline keyboard
@@ -221,12 +245,14 @@ async def handle_confirmed_time(update: Update, context: ContextTypes.DEFAULT_TY
         f"Hi {buyer},\n\n"
         f"This is Nigel from ONSITE310S. Your pre-purchase inspection for the {vehicle} is confirmed for:\n\n"
         f"{confirmed_time}\n\n"
-        f"I'll see you then. A receipt will also be sent from QuickBooks.\n\n"
+        f"Pre-payment of $200 + tax is required by e-transfer to secure the appointment.\n"
+        f"Send to: onsite310s@gmail.com\n\n"
+        f"Once payment is received I'll call the seller to coordinate the inspection.\n\n"
         f"Thank you,\n"
         f"Nigel Devonish\n"
         f"ONSITE310S Inc.\n"
         f"Mobile Pre-Purchase Inspections\n"
-        f"$200 + tax · Mississauga & GTA"
+        f"Mississauga & GTA"
     )
 
     # Send email via Resend
@@ -441,14 +467,15 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ──────────────────────────────────────────────────────────────
 async def new_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
-    context.user_data["files"] = {}
-    context.user_data["notes"] = []
-    context.user_data["raw_texts"] = {}
+    context.user_data["photos"] = {}
+    context.user_data["docs"] = {}
+    context.user_data["assessment"] = ""
+    context.user_data["photo_index"] = 0
     await update.message.reply_text(
         "🆕 *New Inspection Report*\n\n"
         "Send vehicle details:\n"
-        "`Year Make Model Trim | VIN | Odometer_km | Owners | Accident status | Province`\n\n"
-        "Example:\n`2019 Honda Civic EX | 2HGFC2F59KH123456 | 87450 | 2 | No accidents | ON`",
+        "`Year Make Model Trim | VIN | Odometer_km`\n\n"
+        "Example:\n`2019 Honda Civic EX | 2HGFC2F59KH123456 | 87450`",
         parse_mode="Markdown",
     )
     return WAITING_VEHICLE
@@ -457,88 +484,150 @@ async def new_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def receive_vehicle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     parts = [p.strip() for p in text.split("|")]
-    vehicle = {
-        "year": "YYYY", "make": "MAKE", "model": "MODEL", "trim": "",
-        "vin": "XXXXXXXXXXXXXXX", "odo_scan": "N/A", "odo_carfax": "N/A",
-        "owners": "N/A", "accident": "No accidents reported", "province": "ON",
-    }
+    vehicle = {"year": "YYYY", "make": "MAKE", "model": "MODEL", "trim": "", "vin": "N/A", "odo": "N/A"}
     if parts:
         tokens = parts[0].split()
         if tokens and tokens[0].isdigit():
             vehicle["year"] = tokens[0]
-            if len(tokens) > 1:
-                vehicle["make"] = tokens[1]
-            if len(tokens) > 2:
-                vehicle["model"] = tokens[2]
-            if len(tokens) > 3:
-                vehicle["trim"] = " ".join(tokens[3:])
-    if len(parts) >= 2:
-        vehicle["vin"] = parts[1]
-    if len(parts) >= 3:
-        vehicle["odo_scan"] = parts[2]
-    if len(parts) >= 4:
-        vehicle["owners"] = parts[3]
-    if len(parts) >= 5:
-        vehicle["accident"] = parts[4]
-    if len(parts) >= 6:
-        vehicle["province"] = parts[5]
+            if len(tokens) > 1: vehicle["make"] = tokens[1]
+            if len(tokens) > 2: vehicle["model"] = tokens[2]
+            if len(tokens) > 3: vehicle["trim"] = " ".join(tokens[3:])
+    if len(parts) >= 2: vehicle["vin"] = parts[1]
+    if len(parts) >= 3: vehicle["odo"] = parts[2]
 
     context.user_data["vehicle"] = vehicle
+    context.user_data["photo_index"] = 0
+    section_key, section_name = PHOTO_SECTIONS[0]
     await update.message.reply_text(
         f"✅ Vehicle: *{vehicle['year']} {vehicle['make']} {vehicle['model']}*\n"
         f"VIN: `{vehicle['vin']}`\n\n"
-        "Upload PDFs (Carfax, Autel, Battery, Paint). Type *done* when finished.",
+        f"Now send photos. First: *{section_name}*\n"
+        f"(Send the photo, or type *skip* to move on)",
         parse_mode="Markdown",
     )
-    return WAITING_FILES
+    return WAITING_PHOTOS
 
 
-async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    file_obj = message.document or (message.photo[-1] if message.photo else None)
+async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    idx = context.user_data.get("photo_index", 0)
+    if idx >= len(PHOTO_SECTIONS):
+        return await start_docs(update, context)
+
+    section_key, section_name = PHOTO_SECTIONS[idx]
+    text = (update.message.text or "").strip().lower()
+
+    if text == "skip":
+        context.user_data["photo_index"] = idx + 1
+        if idx + 1 >= len(PHOTO_SECTIONS):
+            return await start_docs(update, context)
+        next_key, next_name = PHOTO_SECTIONS[idx + 1]
+        await update.message.reply_text(f"Skipped. Next: *{next_name}*", parse_mode="Markdown")
+        return WAITING_PHOTOS
+
+    file_obj = update.message.photo[-1] if update.message.photo else update.message.document
     if not file_obj:
-        await message.reply_text("Please send a PDF or image.")
-        return WAITING_FILES
+        await update.message.reply_text(f"Please send a photo for *{section_name}*, or type *skip*.", parse_mode="Markdown")
+        return WAITING_PHOTOS
 
-    file_name = getattr(file_obj, "file_name", None) or f"photo_{file_obj.file_id}.jpg"
     tg_file = await file_obj.get_file()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_name)[1]) as tmp:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
         await tg_file.download_to_drive(tmp.name)
-        tmp_path = tmp.name
+        context.user_data["photos"][section_key] = tmp.name
 
-    extracted = ""
-    if file_name.lower().endswith(".pdf") or (getattr(file_obj, "mime_type", "") or "").find("pdf") >= 0:
-        extracted = extract_text_from_pdf(tmp_path)
-        context.user_data["raw_texts"][file_name] = extracted[:15000]
+    context.user_data["photo_index"] = idx + 1
+    if idx + 1 >= len(PHOTO_SECTIONS):
+        return await start_docs(update, context)
+
+    next_key, next_name = PHOTO_SECTIONS[idx + 1]
+    await update.message.reply_text(f"✅ Got *{section_name}*. Next: *{next_name}*", parse_mode="Markdown")
+    return WAITING_PHOTOS
+
+
+async def start_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📄 Now upload the PDFs:\n"
+        "• Paint thickness report\n"
+        "• System scan (Autel)\n"
+        "• Battery / alternator test\n\n"
+        "Send them one by one, then type *done*.",
+        parse_mode="Markdown",
+    )
+    return WAITING_DOCS
+
+
+async def receive_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip().lower()
+    if text == "done":
+        await update.message.reply_text(
+            "📝 Finally, type your assessment for the customer.\n\n"
+            "Include key concerns, items that affect price, or reasons they should walk away.\n"
+            "Type *done* when finished.",
+            parse_mode="Markdown",
+        )
+        return WAITING_ASSESSMENT
+
+    file_obj = update.message.document
+    if not file_obj:
+        await update.message.reply_text("Please send a PDF or type *done*.", parse_mode="Markdown")
+        return WAITING_DOCS
+
+    file_name = file_obj.file_name or "document.pdf"
+    tg_file = await file_obj.get_file()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        await tg_file.download_to_drive(tmp.name)
+        extracted = extract_text_from_pdf(tmp.name)
 
     lower = file_name.lower()
     category = "other"
-    if any(k in lower for k in ["carfax", "history"]):
-        category = "carfax"
-    elif any(k in lower for k in ["autel", "scan", "diagnostic", "dtc"]):
-        category = "diagnostics"
-    elif any(k in lower for k in ["battery", "batt"]):
-        category = "battery"
-    elif any(k in lower for k in ["paint", "nexptg", "thickness"]):
+    if any(k in lower for k in ["paint", "nexptg", "thickness"]):
         category = "paint"
+    elif any(k in lower for k in ["autel", "scan", "diagnostic"]):
+        category = "scan"
+    elif any(k in lower for k in ["battery", "alternator", "batt"]):
+        category = "battery"
 
-    context.user_data["files"][category] = {
-        "name": file_name, "path": tmp_path, "extracted": extracted[:3000]
-    }
-    await message.reply_text(f"✅ Received *{file_name}* ({category}). Send more or type *done*.", parse_mode="Markdown")
-    return WAITING_FILES
+    context.user_data["docs"][category] = {"name": file_name, "path": tmp.name, "text": extracted[:4000]}
+    await update.message.reply_text(f"✅ Received *{file_name}*. Send more or type *done*.", parse_mode="Markdown")
+    return WAITING_DOCS
 
 
-async def receive_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def receive_assessment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
-    if text.lower() in ("done", "finish", "ready", "generate"):
-        return await ask_confirm(update, context)
-    if update.message.voice:
-        await update.message.reply_text("🎤 Voice received — please also send a short text summary.")
-        return WAITING_NOTES
-    context.user_data.setdefault("notes", []).append(text)
-    await update.message.reply_text("✅ Note added. Type *done* to generate report.", parse_mode="Markdown")
-    return WAITING_NOTES
+    if text.lower() == "done":
+        return await generate_report(update, context)
+    context.user_data["assessment"] = (context.user_data.get("assessment", "") + "\n" + text).strip()
+    await update.message.reply_text("✅ Added. Type *done* to generate the report.", parse_mode="Markdown")
+    return WAITING_ASSESSMENT
+
+
+async def generate_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    vehicle = context.user_data.get("vehicle", {})
+    photos = context.user_data.get("photos", {})
+    docs = context.user_data.get("docs", {})
+    assessment = context.user_data.get("assessment", "No additional notes.")
+
+    title = f"{vehicle.get('year','')} {vehicle.get('make','')} {vehicle.get('model','')}".strip()
+    report = f"# Inspection Report: {title}\n"
+    report += f"**VIN:** {vehicle.get('vin','N/A')}\n"
+    report += f"**Odometer:** {vehicle.get('odo','N/A')} km\n\n"
+    report += "## Technician Assessment\n"
+    report += assessment + "\n\n"
+    report += "## Documents Received\n"
+    for cat, info in docs.items():
+        report += f"- {cat.title()}: {info['name']}\n"
+    report += f"\n## Photos Collected: {len(photos)}\n"
+
+    # Publish to Telegraph
+    try:
+        token = TELEGRAPH_ACCESS_TOKEN or await create_telegraph_account()
+        url = await publish_to_telegraph(token, f"Inspection — {title}", report)
+        await update.message.reply_text(f"✅ Report ready:\n{url}")
+    except Exception as e:
+        logger.error(f"Telegraph failed: {e}")
+        await update.message.reply_text(f"Report generated (Telegraph failed):\n\n{report[:3500]}")
+
+    context.user_data.clear()
+    return ConversationHandler.END
 
 
 async def ask_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -691,15 +780,15 @@ def main():
         entry_points=[CommandHandler("new", new_report)],
         states={
             WAITING_VEHICLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_vehicle)],
-            WAITING_FILES: [
-                MessageHandler(filters.Document.ALL | filters.PHOTO, receive_file),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_notes),
+            WAITING_PHOTOS: [
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, receive_photo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_photo),
             ],
-            WAITING_NOTES: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_notes),
-                MessageHandler(filters.VOICE, receive_notes),
+            WAITING_DOCS: [
+                MessageHandler(filters.Document.ALL, receive_doc),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_doc),
             ],
-            WAITING_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_and_publish)],
+            WAITING_ASSESSMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_assessment)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
