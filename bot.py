@@ -14,6 +14,8 @@ import logging
 import tempfile
 import asyncio
 import threading
+import random
+import string
 from datetime import datetime
 from typing import Dict, Any, Optional
 from urllib.parse import quote
@@ -75,7 +77,9 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────
 # BOOKING: format message + inline keyboard
 # ──────────────────────────────────────────────────────────────
-def build_booking_keyboard(phone: str, location: str, date: str, time: str, vehicle: str) -> InlineKeyboardMarkup:
+def generate_client_code() -> str:
+    """Short code to match a booking to its inspection report."""
+    return "ONS-" + "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
     """Inline buttons under every booking notification."""
     # Normalize phone for tel: link
     phone_digits = re.sub(r"[^\d+]", "", phone or "")
@@ -123,6 +127,9 @@ def build_booking_keyboard(phone: str, location: str, date: str, time: str, vehi
 
 def format_booking_message(data: Dict[str, str]) -> str:
     """Human-readable booking alert for Telegram."""
+    client_code = data.get("client_code") or generate_client_code()
+    data["client_code"] = client_code
+
     name = data.get("name", "—")
     phone = data.get("phone", "—")
     email = data.get("email", "")
@@ -131,19 +138,32 @@ def format_booking_message(data: Dict[str, str]) -> str:
     date = data.get("date", "—")
     time = data.get("time", "—")
     notes = data.get("notes", "")
+    sale_type = data.get("saleType", "")
+    seller_name = data.get("sellerName", "")
+    seller_phone = data.get("sellerPhone", "")
+    listing = data.get("listing", "")
+    concerns = data.get("concerns", "")
 
     text = (
-        f"🆕 *New Inspection Booking*\n\n"
-        f"👤 *Name:* {name}\n"
-        f"📱 *Phone:* `{phone}`\n"
+        f"🆕 *New Inspection Booking*\n"
+        f"🔖 *Client Code:* `{client_code}`\n\n"
+        f"👤 *Buyer:* {name}\n"
+        f"📱 *Buyer Phone:* `{phone}`\n"
     )
     if email:
-        text += f"✉️ *Email:* {email}\n"
+        text += f"✉️ *Buyer Email:* {email}\n"
     text += (
         f"🚗 *Vehicle:* {vehicle}\n"
+        f"🏷️ *Sale Type:* {sale_type or '—'}\n"
         f"📍 *Location:* {location}\n"
         f"🗓️ *When:* {date} — {time}\n"
     )
+    if seller_name or seller_phone:
+        text += f"\n👤 *Seller:* {seller_name or '—'}\n📱 *Seller Phone:* `{seller_phone or '—'}`\n"
+    if listing:
+        text += f"🔗 *Listing:* {listing}\n"
+    if concerns:
+        text += f"\n⚠️ *Concerns:* {concerns}\n"
     if notes:
         text += f"\n📝 *Notes:* {notes}\n"
     text += f"\n_Received {datetime.now().strftime('%Y-%m-%d %H:%M')}_"
@@ -458,16 +478,37 @@ async def new_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["rating"] = ""
     await update.message.reply_text(
         "🆕 *New Inspection Report*\n\n"
-        "First, send vehicle details:\n"
-        "`Year Make Model Trim | VIN | Odometer_km`\n\n"
-        "Example:\n`2019 Honda Civic EX | 2HGFC2F59KH123456 | 87450`",
+        "First, enter the *Client Code* from the booking\n"
+        "(example: `ONS-A3K9`) or type *new* to generate one.",
         parse_mode="Markdown",
     )
+    context.user_data["awaiting_code"] = True
     return WAITING_VEHICLE
 
 
 async def receive_vehicle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+
+    # First message is the client code
+    if context.user_data.get("awaiting_code"):
+        if text.lower() == "new":
+            code = generate_client_code()
+        else:
+            code = text.upper().replace(" ", "")
+            if not code.startswith("ONS-"):
+                code = "ONS-" + code
+        context.user_data["client_code"] = code
+        context.user_data["awaiting_code"] = False
+        await update.message.reply_text(
+            f"🔖 Client Code: `{code}`\n\n"
+            "Now send vehicle details:\n"
+            "`Year Make Model Trim | VIN | Odometer_km`\n\n"
+            "Example:\n`2019 Honda Civic EX | 2HGFC2F59KH123456 | 87450`",
+            parse_mode="Markdown",
+        )
+        return WAITING_VEHICLE
+
+    # Second message is vehicle details
     parts = [p.strip() for p in text.split("|")]
     vehicle = {"year": "YYYY", "make": "MAKE", "model": "MODEL", "trim": "", "vin": "N/A", "odo": "N/A"}
     if parts:
@@ -482,7 +523,8 @@ async def receive_vehicle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["vehicle"] = vehicle
 
     await update.message.reply_text(
-        f"✅ Vehicle: *{vehicle['year']} {vehicle['make']} {vehicle['model']}*\n\n"
+        f"✅ Vehicle: *{vehicle['year']} {vehicle['make']} {vehicle['model']}*\n"
+        f"Client Code: `{context.user_data.get('client_code')}`\n\n"
         "*Phase 1 — Upload the 4 PDFs:*\n"
         "1. Carfax Report\n"
         "2. Full System Diagnostic Scan\n"
@@ -669,10 +711,12 @@ async def receive_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def compile_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vehicle = context.user_data.get("vehicle", {})
+    client_code = context.user_data.get("client_code", "ONS-????")
     title = f"{vehicle.get('year','')} {vehicle.get('make','')} {vehicle.get('model','')}".strip()
 
     report = f"# ONSITE310S Inspection Report\n"
     report += f"## {title}\n"
+    report += f"**Client Code:** {client_code}\n"
     report += f"**VIN:** {vehicle.get('vin','N/A')}\n"
     report += f"**Odometer:** {vehicle.get('odo','N/A')} km\n"
     report += f"**Overall Rating:** {context.user_data.get('rating','N/A')}\n\n"
@@ -694,11 +738,16 @@ async def compile_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.callback_query.message if update.callback_query else update.message
     try:
         token = TELEGRAPH_ACCESS_TOKEN or await create_telegraph_account()
-        url = await publish_to_telegraph(token, f"Inspection — {title}", report)
-        await msg.reply_text(f"✅ Report compiled:\n{url}")
+        url = await publish_to_telegraph(token, f"{client_code} — {title}", report)
+        await msg.reply_text(
+            f"✅ Report ready\n"
+            f"🔖 Client Code: `{client_code}`\n"
+            f"🔗 {url}\n\n"
+            f"Share this link via Telegram, WhatsApp, or email."
+        )
     except Exception as e:
         logger.error(f"Telegraph failed: {e}")
-        await msg.reply_text(f"Report ready (link failed):\n\n{report[:3500]}")
+        await msg.reply_text(f"Report ready (link failed):\n🔖 {client_code}\n\n{report[:3500]}")
 
     context.user_data.clear()
     return ConversationHandler.END
