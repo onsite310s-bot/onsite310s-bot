@@ -167,17 +167,82 @@ async def send_booking_to_owner(context: ContextTypes.DEFAULT_TYPE, data: Dict[s
 
 
 async def booking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle Confirm button presses."""
+    """Handle Confirm button presses — send email via Resend and post a copyable message."""
     query = update.callback_query
     await query.answer()
 
-    if query.data == "booking_confirm":
-        # Edit original message to show confirmed
-        original = query.message.text or ""
-        await query.edit_message_text(
-            text=original + "\n\n✅ *Confirmed — added to your queue*",
-            parse_mode="Markdown",
-        )
+    if query.data != "booking_confirm":
+        return
+
+    original = query.message.text or ""
+    await query.edit_message_text(
+        text=original + "\n\n✅ *Confirmed — added to your queue*",
+        parse_mode="Markdown",
+    )
+
+    # Extract details from the booking message
+    lines = original.splitlines()
+    buyer = "there"
+    email = ""
+    vehicle = "your vehicle"
+    when = ""
+    for line in lines:
+        clean = line.replace("*", "").replace("`", "")
+        if "Buyer:" in clean or "Name:" in clean:
+            buyer = clean.split(":", 1)[-1].strip()
+        if "Email:" in clean or "Buyer Email:" in clean:
+            email = clean.split(":", 1)[-1].strip()
+        if "Vehicle:" in clean:
+            vehicle = clean.split(":", 1)[-1].strip()
+        if "When:" in clean:
+            when = clean.split(":", 1)[-1].strip()
+
+    confirm_text = (
+        f"Hi {buyer},\n\n"
+        f"This is Nigel from ONSITE310S. I've confirmed your pre-purchase inspection request for the {vehicle}"
+        + (f" on {when}" if when else "")
+        + ".\n\n"
+        f"I'll be in touch shortly to finalize the exact time. A receipt will also be sent from QuickBooks.\n\n"
+        f"Thank you,\n"
+        f"Nigel Devonish\n"
+        f"ONSITE310S Inc.\n"
+        f"Mobile Pre-Purchase Inspections\n"
+        f"$200 + tax · Mississauga & GTA"
+    )
+
+    # Send email via Resend if we have an address and API key
+    resend_key = os.getenv("RESEND_API_KEY")
+    email_sent = False
+    if email and resend_key:
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.post(
+                    "https://api.resend.com/emails",
+                    headers={
+                        "Authorization": f"Bearer {resend_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "from": "ONSITE310S <bookings@onsite310s.ca>",
+                        "to": [email],
+                        "subject": "Inspection Booking Confirmed — ONSITE310S",
+                        "text": confirm_text,
+                    },
+                    timeout=15,
+                )
+                if r.status_code in (200, 201):
+                    email_sent = True
+                else:
+                    logger.error(f"Resend error: {r.status_code} {r.text}")
+        except Exception as e:
+            logger.error(f"Email send failed: {e}")
+
+    # Always post the message in Telegram so the owner can copy it
+    status = "✅ Email sent to the customer." if email_sent else "📋 Copy and send this to the customer:"
+    await query.message.reply_text(
+        f"{status}\n\n```\n{confirm_text}\n```",
+        parse_mode="Markdown",
+    )
 
 
 # ──────────────────────────────────────────────────────────────
