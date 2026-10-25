@@ -176,8 +176,7 @@ async def booking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     original = query.message.text or ""
     await query.edit_message_text(
-        text=original + "\n\n✅ *Confirmed — added to your queue*",
-        parse_mode="Markdown",
+        text=original + "\n\n✅ Confirmed — added to your queue"
     )
 
     # Extract details from the booking message
@@ -239,9 +238,9 @@ async def booking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Always post the message in Telegram so the owner can copy it
     status = "✅ Email sent to the customer." if email_sent else "📋 Copy and send this to the customer:"
+    # Send as plain text to avoid Markdown parsing errors
     await query.message.reply_text(
-        f"{status}\n\n```\n{confirm_text}\n```",
-        parse_mode="Markdown",
+        f"{status}\n\n{confirm_text}"
     )
 
 
