@@ -167,7 +167,7 @@ async def send_booking_to_owner(context: ContextTypes.DEFAULT_TYPE, data: Dict[s
 
 
 async def booking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle Confirm button presses — send email via Resend and post a copyable message."""
+    """Handle Confirm button — ask for the confirmed appointment time."""
     query = update.callback_query
     await query.answer()
 
@@ -175,16 +175,39 @@ async def booking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     original = query.message.text or ""
+    # Store booking details so we can use them when the owner replies with the time
+    context.user_data["pending_booking"] = original
+    context.user_data["pending_chat_id"] = query.message.chat_id
+    context.user_data["pending_message_id"] = query.message.message_id
+
     await query.edit_message_text(
-        text=original + "\n\n✅ Confirmed — added to your queue"
+        text=original + "\n\n⏳ Awaiting your confirmed time…"
     )
 
-    # Extract details from the booking message
+    await query.message.reply_text(
+        "What date and time should I confirm with the customer?\n\n"
+        "Reply with something like:\n"
+        "• Tomorrow at 10:30am\n"
+        "• Oct 28 at 2pm\n"
+        "• Monday 9am"
+    )
+
+
+async def handle_confirmed_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner replies with the confirmed appointment time."""
+    if "pending_booking" not in context.user_data:
+        return  # not in a confirmation flow
+
+    confirmed_time = update.message.text.strip()
+    original = context.user_data.pop("pending_booking")
+    context.user_data.pop("pending_chat_id", None)
+    context.user_data.pop("pending_message_id", None)
+
+    # Extract details
     lines = original.splitlines()
     buyer = "there"
     email = ""
     vehicle = "your vehicle"
-    when = ""
     for line in lines:
         clean = line.replace("*", "").replace("`", "")
         if "Buyer:" in clean or "Name:" in clean:
@@ -193,15 +216,12 @@ async def booking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             email = clean.split(":", 1)[-1].strip()
         if "Vehicle:" in clean:
             vehicle = clean.split(":", 1)[-1].strip()
-        if "When:" in clean:
-            when = clean.split(":", 1)[-1].strip()
 
     confirm_text = (
         f"Hi {buyer},\n\n"
-        f"This is Nigel from ONSITE310S. I've confirmed your pre-purchase inspection request for the {vehicle}"
-        + (f" on {when}" if when else "")
-        + ".\n\n"
-        f"I'll be in touch shortly to finalize the exact time. A receipt will also be sent from QuickBooks.\n\n"
+        f"This is Nigel from ONSITE310S. Your pre-purchase inspection for the {vehicle} is confirmed for:\n\n"
+        f"{confirmed_time}\n\n"
+        f"I'll see you then. A receipt will also be sent from QuickBooks.\n\n"
         f"Thank you,\n"
         f"Nigel Devonish\n"
         f"ONSITE310S Inc.\n"
@@ -209,7 +229,7 @@ async def booking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"$200 + tax · Mississauga & GTA"
     )
 
-    # Send email via Resend if we have an address and API key
+    # Send email via Resend
     resend_key = os.getenv("RESEND_API_KEY")
     email_sent = False
     if email and resend_key:
@@ -224,7 +244,7 @@ async def booking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     json={
                         "from": "ONSITE310S <bookings@onsite310s.ca>",
                         "to": [email],
-                        "subject": "Inspection Booking Confirmed — ONSITE310S",
+                        "subject": f"Inspection Confirmed — {confirmed_time}",
                         "text": confirm_text,
                     },
                     timeout=15,
@@ -236,12 +256,8 @@ async def booking_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Email send failed: {e}")
 
-    # Always post the message in Telegram so the owner can copy it
     status = "✅ Email sent to the customer." if email_sent else "📋 Copy and send this to the customer:"
-    # Send as plain text to avoid Markdown parsing errors
-    await query.message.reply_text(
-        f"{status}\n\n{confirm_text}"
-    )
+    await update.message.reply_text(f"{status}\n\n{confirm_text}")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -694,6 +710,8 @@ def main():
     app.add_handler(CommandHandler("chatid", chatid_cmd))
     app.add_handler(CallbackQueryHandler(booking_callback, pattern="^booking_"))
     app.add_handler(conv)
+    # Handle confirmed appointment time replies (must be before maybe_booking_json)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_confirmed_time))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, maybe_booking_json))
 
     logger.info("ONSITE310S Bot starting…")
